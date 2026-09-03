@@ -6,7 +6,8 @@
 
 import { Command } from 'commander';
 import dotenv from 'dotenv';
-import { resolve } from 'path';
+import { fileURLToPath } from 'url';
+import { dirname, join, resolve } from 'path';
 import { startRepl } from './repl.js';
 import {
   getProviderRegistry,
@@ -14,8 +15,13 @@ import {
   DEFAULT_MODELS,
 } from './providers/provider-registry.js';
 
-// Load .env from the project root (where pibot is invoked)
-dotenv.config();
+// Resolve the PπBot installation directory (since this runs from dist/index.js)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const pibotRoot = join(__dirname, '..');
+
+// Load .env from the PπBot installation directory instead of the user's current working directory
+dotenv.config({ path: join(pibotRoot, '.env') });
 
 const program = new Command();
 

@@ -6,6 +6,7 @@
 import { readFile, stat } from 'fs/promises';
 import type { ToolOutput } from '../types/tools.js';
 import { BaseTool } from './_base-tool.js';
+import type { PathSandbox } from '../safety/path-sandbox.js';
 
 const MAX_FILE_SIZE = 100 * 1024; // 100KB
 
@@ -38,10 +39,16 @@ export default class ReadFileTool extends BaseTool {
     },
   };
 
+  // Injected by AgentRuntime
+  sandbox: PathSandbox | null = null;
+
   protected async run(input: Record<string, unknown>): Promise<ToolOutput> {
-    const filePath = input.path as string;
+    const rawPath = input.path as string;
     const startLine = input.start_line as number | undefined;
     const endLine = input.end_line as number | undefined;
+
+    // Resolve through sandbox if available
+    const filePath = this.sandbox ? this.sandbox.resolve(rawPath) : rawPath;
 
     // Check file exists and size
     let fileStats;

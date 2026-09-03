@@ -7,6 +7,7 @@ import { readdir, readFile, stat } from 'fs/promises';
 import { join, extname } from 'path';
 import type { ToolOutput } from '../types/tools.js';
 import { BaseTool } from './_base-tool.js';
+import type { PathSandbox } from '../safety/path-sandbox.js';
 
 // Directories to skip during search
 const IGNORE_DIRS = new Set([
@@ -72,11 +73,17 @@ export default class SearchCodebaseTool extends BaseTool {
     },
   };
 
+  // Injected by AgentRuntime
+  sandbox: PathSandbox | null = null;
+
   protected async run(input: Record<string, unknown>): Promise<ToolOutput> {
     const query = input.query as string;
-    const searchPath = (input.path as string) ?? '.';
+    const rawPath = (input.path as string) ?? '.';
     const filePattern = input.file_pattern as string | undefined;
     const maxResults = (input.max_results as number) ?? DEFAULT_MAX_RESULTS;
+
+    // Resolve through sandbox if available
+    const searchPath = this.sandbox ? this.sandbox.resolve(rawPath) : rawPath;
 
     if (!query.trim()) {
       return this.fail('VALIDATION_ERROR', 'Search query cannot be empty.');

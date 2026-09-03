@@ -7,6 +7,7 @@ import { readdir, stat } from 'fs/promises';
 import { join } from 'path';
 import type { ToolOutput } from '../types/tools.js';
 import { BaseTool } from './_base-tool.js';
+import type { PathSandbox } from '../safety/path-sandbox.js';
 
 // Directories to always skip
 const DEFAULT_IGNORE = new Set([
@@ -53,10 +54,16 @@ export default class ListDirectoryTool extends BaseTool {
     },
   };
 
+  // Injected by AgentRuntime
+  sandbox: PathSandbox | null = null;
+
   protected async run(input: Record<string, unknown>): Promise<ToolOutput> {
-    const dirPath = input.path as string;
+    const rawPath = input.path as string;
     const recursive = (input.recursive as boolean) ?? false;
     const maxDepth = (input.max_depth as number) ?? 3;
+
+    // Resolve through sandbox if available
+    const dirPath = this.sandbox ? this.sandbox.resolve(rawPath) : rawPath;
 
     const entries: string[] = [];
     let truncated = false;

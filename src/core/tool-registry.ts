@@ -41,8 +41,9 @@ export class ToolRegistry {
         .filter((e) => e.isFile())
         .map((e) => e.name)
         .filter((name) => {
-          // Skip underscore-prefixed files and non-TS/JS files
+          // Skip underscore-prefixed files, declaration files, and maps
           if (name.startsWith('_')) return false;
+          if (name.endsWith('.d.ts') || name.endsWith('.map')) return false;
           return name.endsWith('.ts') || name.endsWith('.js');
         });
     } catch {
