@@ -19,6 +19,8 @@ export interface ChatRequest {
   systemPrompt: string;
   messages: Message[];
   tools?: ToolDefinition[];
+  /** Abort signal for cooperative cancellation of in-flight requests. */
+  signal?: AbortSignal;
 }
 
 // ─── LLM Provider Interface ────────────────────────────────────

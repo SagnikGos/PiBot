@@ -1,6 +1,9 @@
 // ─── PπBot Interactive REPL ─────────────────────────────────────
-// Terminal loop using @clack/prompts. Handles user input, streams
-// LLM responses, and delegates the agent loop to AgentRuntime.
+// Terminal loop using @clack/prompts. Subscribes to AgentRuntime
+// events instead of using direct callbacks — making the REPL a
+// pure renderer of runtime state.
+//
+// Phase 1 refactor: REPL consumes EventBus events.
 
 import * as p from '@clack/prompts';
 import {
@@ -10,8 +13,9 @@ import {
 } from './providers/provider-registry.js';
 import type { LLMProvider } from './types/providers.js';
 import { ToolRegistry } from './core/tool-registry.js';
-import { AgentRuntime } from './core/agent-runtime.js';
+import { AgentRuntime } from './agent/agent-runtime.js';
 import type { AgentConfig } from './types/agent.js';
+import type { AgentEvent } from './events/event-types.js';
 
 // ─── REPL Options ───────────────────────────────────────────────
 
@@ -39,6 +43,7 @@ interface ReplState {
   runtime: AgentRuntime;
   toolRegistry: ToolRegistry;
   options: ReplOptions;
+  unsubscribe: () => void;
 }
 
 function buildAgentConfig(options: ReplOptions): AgentConfig {
@@ -57,75 +62,106 @@ function buildAgentConfig(options: ReplOptions): AgentConfig {
   };
 }
 
-function createRuntime(
-  llm: LLMProvider,
-  toolRegistry: ToolRegistry,
-  options: ReplOptions,
-): AgentRuntime {
+// ─── Event-Driven REPL Renderer ─────────────────────────────────
+// Instead of callback-based rendering, the REPL subscribes to the
+// EventBus and renders events as they arrive.
+
+function createEventRenderer(): {
+  handler: (event: AgentEvent) => void;
+  reset: () => void;
+} {
   let spinner: ReturnType<typeof p.spinner> | null = null;
   let spinnerActive = false;
   let hadText = false;
 
-  return new AgentRuntime(llm, toolRegistry, buildAgentConfig(options), {
-    onTextDelta: (delta) => {
-      if (spinnerActive && spinner) {
-        spinner.stop('');
-        spinnerActive = false;
-      }
-      process.stdout.write(delta);
-      hadText = true;
-    },
+  const stopSpinner = (message = '') => {
+    if (spinnerActive && spinner) {
+      spinner.stop(message);
+      spinnerActive = false;
+      spinner = null;
+    }
+  };
 
-    onToolStart: (name, input) => {
-      if (spinnerActive && spinner) {
-        spinner.stop('');
-        spinnerActive = false;
-      }
-      if (hadText) {
-        process.stdout.write('\n');
-        hadText = false;
-      }
-      const inputPreview = JSON.stringify(input);
-      const truncated = inputPreview.length > 80
-        ? inputPreview.slice(0, 77) + '...'
-        : inputPreview;
-      p.log.info(`🔧 ${name}(${truncated})`);
-      spinner = p.spinner();
-      spinner.start(`Running ${name}...`);
-      spinnerActive = true;
-    },
+  const handler = (event: AgentEvent) => {
+    switch (event.type) {
+      case 'model.delta':
+        stopSpinner();
+        process.stdout.write(event.text);
+        hadText = true;
+        break;
 
-    onToolEnd: (name, output, isError) => {
-      if (spinner) {
-        spinner.stop(isError ? `❌ ${name} failed` : `✅ ${name} done`);
-        spinnerActive = false;
-        spinner = null;
+      case 'tool.started': {
+        stopSpinner();
+        if (hadText) {
+          process.stdout.write('\n');
+          hadText = false;
+        }
+        const inputPreview = JSON.stringify(event.input);
+        const truncated = inputPreview.length > 80
+          ? inputPreview.slice(0, 77) + '...'
+          : inputPreview;
+        p.log.info(`🔧 ${event.name}(${truncated})`);
+        spinner = p.spinner();
+        spinner.start(`Running ${event.name}...`);
+        spinnerActive = true;
+        break;
       }
-      const preview = output.length > 300
-        ? output.slice(0, 297) + '...'
-        : output;
-      p.log.message(preview);
-      // Start thinking spinner for next LLM call
-      spinner = p.spinner();
-      spinner.start('Thinking (follow-up)...');
-      spinnerActive = true;
-    },
 
-    onIterationEnd: (_iteration, _stopReason) => {
-      if (hadText) {
-        process.stdout.write('\n');
-        hadText = false;
+      case 'tool.completed': {
+        const isError = event.result.is_error;
+        stopSpinner(isError ? `❌ ${event.name} failed` : `✅ ${event.name} done`);
+        const preview = event.result.content.length > 300
+          ? event.result.content.slice(0, 297) + '...'
+          : event.result.content;
+        p.log.message(preview);
+        // Start thinking spinner for next LLM call
+        spinner = p.spinner();
+        spinner.start('Thinking (follow-up)...');
+        spinnerActive = true;
+        break;
       }
-    },
 
-    onMaxIterations: (limit) => {
-      if (spinnerActive && spinner) {
-        spinner.stop('');
-        spinnerActive = false;
-      }
-      p.log.warn(`Reached max iterations (${limit}). The agent stopped.`);
-    },
-  });
+      case 'turn.completed':
+        if (hadText) {
+          process.stdout.write('\n');
+          hadText = false;
+        }
+        break;
+
+      case 'agent.max_iterations':
+        stopSpinner();
+        p.log.warn(`Reached max iterations (${event.limit}). The agent stopped.`);
+        break;
+
+      case 'agent.cancelled':
+        stopSpinner();
+        p.log.warn('Operation cancelled.');
+        break;
+
+      case 'agent.error':
+        stopSpinner();
+        p.log.error(`Error: ${event.error.message}`);
+        break;
+    }
+  };
+
+  const reset = () => {
+    stopSpinner();
+    hadText = false;
+  };
+
+  return { handler, reset };
+}
+
+function createRuntime(
+  llm: LLMProvider,
+  toolRegistry: ToolRegistry,
+  options: ReplOptions,
+): { runtime: AgentRuntime; unsubscribe: () => void } {
+  const runtime = new AgentRuntime(llm, toolRegistry, buildAgentConfig(options));
+  const renderer = createEventRenderer();
+  const unsubscribe = runtime.eventBus.on(renderer.handler);
+  return { runtime, unsubscribe };
 }
 
 function createSlashCommands(): SlashCommand[] {
@@ -170,10 +206,15 @@ function createSlashCommands(): SlashCommand[] {
           model: newModel,
           maxTokens: state.options.maxTokens,
         });
-        state.runtime = createRuntime(state.llm, state.toolRegistry, {
+
+        // Unsubscribe old event handler and create new runtime
+        state.unsubscribe();
+        const { runtime, unsubscribe } = createRuntime(state.llm, state.toolRegistry, {
           ...state.options,
           model: newModel,
         });
+        state.runtime = runtime;
+        state.unsubscribe = unsubscribe;
 
         p.log.success(`Switched to model: ${newModel}`);
         return true;
@@ -214,11 +255,16 @@ function createSlashCommands(): SlashCommand[] {
           model: newModel,
           maxTokens: state.options.maxTokens,
         });
-        state.runtime = createRuntime(state.llm, state.toolRegistry, {
+
+        // Unsubscribe old event handler and create new runtime
+        state.unsubscribe();
+        const { runtime, unsubscribe } = createRuntime(state.llm, state.toolRegistry, {
           ...state.options,
           provider: newProvider,
           model: newModel,
         });
+        state.runtime = runtime;
+        state.unsubscribe = unsubscribe;
 
         p.log.success(`Switched to ${newProvider} / ${newModel}`);
         return true;
@@ -260,8 +306,8 @@ export async function startRepl(options: ReplOptions): Promise<void> {
   const toolRegistry = new ToolRegistry();
   await toolRegistry.discoverBuiltinTools();
 
-  // ── Create AgentRuntime ─────────────────────────────────────
-  const runtime = createRuntime(llm, toolRegistry, options);
+  // ── Create AgentRuntime (with EventBus subscription) ────────
+  const { runtime, unsubscribe } = createRuntime(llm, toolRegistry, options);
 
   // ── State ───────────────────────────────────────────────────
   const state: ReplState = {
@@ -271,6 +317,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
     runtime,
     toolRegistry,
     options,
+    unsubscribe,
   };
 
   const slashCommands = createSlashCommands();
@@ -291,6 +338,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
 
     if (p.isCancel(input)) {
       p.cancel('Session cancelled.');
+      state.unsubscribe();
       process.exit(0);
     }
 
@@ -318,39 +366,48 @@ export async function startRepl(options: ReplOptions): Promise<void> {
     const s = p.spinner();
     s.start('Thinking...');
 
-    try {
-      // Stop the "Thinking..." spinner once first text arrives
-      // The runtime callbacks handle the rest of the UI
-      let spinnerStopped = false;
+    // Create an AbortController for Ctrl+C cancellation
+    const abortController = new AbortController();
 
-      // Patch: stop the initial spinner on first text/tool event
-      // We do this by intercepting — the runtime's callbacks already handle it.
-      // The spinner started above is stopped by the first callback.
-      // Trick: wrap the runtime so it stops our spinner first.
-      const wrappedRuntime = {
-        run: async (msg: string) => {
-          const stopInitialSpinner = () => {
-            if (!spinnerStopped) {
-              s.stop('');
-              spinnerStopped = true;
-            }
-          };
-          // We need to hook into the first onTextDelta / onToolStart
-          // The AgentRuntime calls its own callbacks — we can't easily intercept.
-          // Solution: stop the spinner in a microtask race.
-          const runPromise = state.runtime.run(msg);
-          // Stop spinner after a short delay if callbacks haven't already
-          setTimeout(stopInitialSpinner, 100);
-          await runPromise;
-          stopInitialSpinner();
-        },
+    // Set up Ctrl+C handler for this run
+    const onSigint = () => {
+      abortController.abort(new Error('User cancelled'));
+    };
+    process.once('SIGINT', onSigint);
+
+    try {
+      // Stop initial spinner once first text/tool event arrives
+      let spinnerStopped = false;
+      const stopInitialSpinner = () => {
+        if (!spinnerStopped) {
+          s.stop('');
+          spinnerStopped = true;
+        }
       };
 
-      await wrappedRuntime.run(trimmed);
+      // Subscribe to first event to stop the initial spinner
+      const unsub = state.runtime.eventBus.onTypes(
+        ['model.delta', 'tool.started', 'agent.error'],
+        () => {
+          stopInitialSpinner();
+          unsub();
+        },
+      );
+
+      const result = await state.runtime.run({
+        message: trimmed,
+        signal: abortController.signal,
+      });
+
+      stopInitialSpinner();
 
       // Token stats
       const stats = state.runtime.tokenStats;
       p.log.step(`tokens: ${stats.input} in / ${stats.output} out`);
+
+      if (result.status === 'cancelled') {
+        p.log.warn('Run cancelled by user.');
+      }
     } catch (error) {
       s.stop('Error');
       const message = error instanceof Error ? error.message : String(error);
@@ -360,8 +417,11 @@ export async function startRepl(options: ReplOptions): Promise<void> {
       if (msgs.length > 0 && msgs[msgs.length - 1].role === 'user') {
         state.runtime.messages = msgs.slice(0, -1);
       }
+    } finally {
+      process.removeListener('SIGINT', onSigint);
     }
   }
 
+  state.unsubscribe();
   p.outro('Goodbye! 👋');
 }
