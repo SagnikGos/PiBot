@@ -8,24 +8,26 @@
 import type { LLMProvider, ChatRequest } from '../types/providers.js';
 import type { Message, ContentBlock, LLMResponse } from '../types/messages.js';
 import type { ToolOutput } from '../types/tools.js';
-import type { ToolRegistry } from '../core/tool-registry.js';
+import type { ToolRuntime } from '../tools/tool-runtime.js';
 import type { EventBus } from '../events/event-bus.js';
 import type { RunResult } from './turn-result.js';
 import { ConversationState } from '../core/conversation-state.js';
-import { buildSystemPrompt } from '../core/context-builder.js';
+import { ContextEngine } from '../context/context-engine.js';
 import { PathSandbox } from '../safety/path-sandbox.js';
 import { findDangerousPattern, confirmDangerousCommand } from '../safety/human-confirm.js';
 import { throwIfAborted } from './cancellation.js';
 import { CancellationError } from '../types/domain-types.js';
 import ExecuteCommandTool from '../tools/execute-command.js';
 
+import type { SessionRepository } from '../storage/session-repo.js';
+
 // ─── Configuration ──────────────────────────────────────────────
 
 export interface ConversationLoopConfig {
   /** LLM provider instance. */
   llm: LLMProvider;
-  /** Tool registry with discovered tools. */
-  toolRegistry: ToolRegistry;
+  /** Tool runtime for managing and executing tools. */
+  toolRuntime: ToolRuntime;
   /** Event bus for runtime events. */
   eventBus: EventBus;
   /** Absolute path to the project root. */
@@ -38,9 +40,13 @@ export interface ConversationLoopConfig {
   maxIterations: number;
   /** Dangerous command regex patterns. */
   dangerousCommands: string[];
+  /** Session repository for persistence. */
+  sessionRepo?: SessionRepository;
 }
 
 export interface RunInput {
+  /** The session ID to resume, or null for new session. */
+  sessionId?: string;
   /** The user's message. */
   message: string;
   /** Abort signal for cooperative cancellation. */
@@ -53,6 +59,7 @@ export class ConversationLoop {
   private readonly config: ConversationLoopConfig;
   private readonly conversationState: ConversationState;
   private readonly sandbox: PathSandbox;
+  private readonly contextEngine: ContextEngine;
 
   private totalInputTokens = 0;
   private totalOutputTokens = 0;
@@ -63,6 +70,13 @@ export class ConversationLoop {
     this.conversationState = new ConversationState({
       maxTokens: 80_000,
       minRecentMessages: 10,
+    });
+
+    const toolDefinitions = config.toolRuntime.getDefinitions();
+    this.contextEngine = new ContextEngine({
+      projectRoot: config.projectRoot,
+      toolNames: toolDefinitions.length > 0 ? config.toolRuntime.listTools() : undefined,
+      maxTokens: 80_000,
     });
 
     this.sandbox = new PathSandbox(config.projectRoot);
@@ -91,17 +105,41 @@ export class ConversationLoop {
   /**
    * Run the Think → Act → Observe loop for a user message.
    */
-  async run(input: RunInput): Promise<RunResult> {
-    const { message, signal } = input;
-    const { toolRegistry, eventBus, maxIterations } = this.config;
+  async run(input: RunInput): Promise<RunResult & { sessionId?: string }> {
+    const { message, signal, sessionId } = input;
+    const { toolRuntime, eventBus, maxIterations, sessionRepo } = this.config;
 
     // Check for cancellation before starting
     throwIfAborted(signal);
 
+    let activeSessionId = sessionId;
+
+    if (sessionRepo) {
+      if (activeSessionId) {
+        // Resume session
+        const session = sessionRepo.getSession(activeSessionId);
+        if (!session) {
+          throw new Error(`Session ${activeSessionId} not found`);
+        }
+        // Load history
+        const history = sessionRepo.getFullConversation(activeSessionId);
+        this.conversationState.messages = history;
+        eventBus.emit({ type: 'session.resumed', sessionId: activeSessionId });
+      } else {
+        // Create new session
+        const session = sessionRepo.createSession(this.config.projectRoot);
+        activeSessionId = session.id;
+        eventBus.emit({ type: 'session.started', sessionId: activeSessionId });
+      }
+    }
+
     // Append user message
     this.conversationState.push({ role: 'user', content: message });
+    
+    // Track turn starting index
+    let turnIndexOffset = this.conversationState.messages.length - 1; // user message is at the end
 
-    const toolDefinitions = toolRegistry.getDefinitions();
+    const toolDefinitions = toolRuntime.getDefinitions();
     const hasTools = toolDefinitions.length > 0;
     let iterations = 0;
 
@@ -114,10 +152,7 @@ export class ConversationLoop {
       eventBus.emit({ type: 'turn.started', turnIndex: i });
 
       // ── Build context ──────────────────────────────────────
-      const systemPrompt = buildSystemPrompt({
-        projectRoot: this.config.projectRoot,
-        toolNames: hasTools ? toolRegistry.listTools() : undefined,
-      });
+      const systemPrompt = this.contextEngine.buildSystemPrompt();
 
       // ── Think: call LLM with streaming ─────────────────────
       eventBus.emit({
@@ -148,6 +183,7 @@ export class ConversationLoop {
             status: 'cancelled',
             totalUsage: { inputTokens: this.totalInputTokens, outputTokens: this.totalOutputTokens },
             iterations,
+            sessionId: activeSessionId
           };
         }
         throw error;
@@ -170,6 +206,7 @@ export class ConversationLoop {
           status: 'completed',
           totalUsage: { inputTokens: this.totalInputTokens, outputTokens: this.totalOutputTokens },
           iterations,
+          sessionId: activeSessionId
         };
       }
 
@@ -183,6 +220,26 @@ export class ConversationLoop {
 
       // ── Observe: append results ────────────────────────────
       this.conversationState.push({ role: 'user', content: toolResults });
+
+      // Save turn to DB
+      if (sessionRepo && activeSessionId) {
+        // A turn consists of: user message (or tool results), and the assistant response.
+        // For iteration 0, it's the initial user message + assistant response + tool results (if any).
+        // For iteration > 0, it's the tool results + assistant response + tool results (if any).
+        // To keep it simple, we save the delta of messages since the turn started.
+        const turnMessages = this.conversationState.messages.slice(turnIndexOffset);
+        sessionRepo.saveTurn(
+          activeSessionId,
+          i,
+          turnMessages,
+          response.usage.inputTokens,
+          response.usage.outputTokens
+        );
+        sessionRepo.updateSessionTokens(activeSessionId, response.usage.inputTokens, response.usage.outputTokens);
+        
+        // Reset offset for next turn
+        turnIndexOffset = this.conversationState.messages.length;
+      }
     }
 
     // Hit the iteration cap
@@ -191,6 +248,7 @@ export class ConversationLoop {
       status: 'max_iterations',
       totalUsage: { inputTokens: this.totalInputTokens, outputTokens: this.totalOutputTokens },
       iterations,
+      sessionId: activeSessionId
     };
   }
 
@@ -284,7 +342,7 @@ export class ConversationLoop {
         input: toolCall.input,
       });
 
-      const output = await this.config.toolRegistry.execute(toolCall.name, toolCall.input);
+      const output = await this.config.toolRuntime.execute(toolCall.name, toolCall.input);
 
       eventBus.emit({
         type: 'tool.completed',
@@ -307,8 +365,8 @@ export class ConversationLoop {
   // ─── Private: Wire safety into tools ───────────────────────
 
   private injectSafety(): void {
-    for (const name of this.config.toolRegistry.listTools()) {
-      const tool = this.config.toolRegistry.get(name);
+    for (const name of this.config.toolRuntime.listTools()) {
+      const tool = this.config.toolRuntime.get(name);
       if (!tool) continue;
 
       if (tool instanceof ExecuteCommandTool) {

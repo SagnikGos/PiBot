@@ -49,6 +49,10 @@ program
     '25',
   )
   .option(
+    '--resume <id>',
+    'Resume a previous session by ID',
+  )
+  .option(
     '--list-providers',
     'List available providers and exit',
   )
@@ -56,6 +60,7 @@ program
     const providerName: string = options.provider;
     const projectRoot = resolve(options.path);
     const maxIterations = parseInt(options.maxIterations, 10);
+    const resumeSessionId = options.resume as string | undefined;
 
     // ── List providers mode ─────────────────────────────────
     if (options.listProviders) {
@@ -93,6 +98,7 @@ program
       projectRoot,
       maxIterations,
       maxTokens: 8192,
+      resumeSessionId,
     });
   });
 

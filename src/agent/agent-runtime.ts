@@ -8,10 +8,12 @@
 import type { LLMProvider } from '../types/providers.js';
 import type { Message } from '../types/messages.js';
 import type { AgentConfig } from '../types/agent.js';
-import type { ToolRegistry } from '../core/tool-registry.js';
+import type { ToolRuntime } from '../tools/tool-runtime.js';
 import { EventBus } from '../events/event-bus.js';
 import { ConversationLoop, type RunInput } from './conversation-loop.js';
 import type { RunResult } from './turn-result.js';
+
+import type { SessionRepository } from '../storage/session-repo.js';
 
 // ─── AgentRuntime ───────────────────────────────────────────────
 
@@ -24,20 +26,22 @@ export class AgentRuntime {
 
   constructor(
     llm: LLMProvider,
-    toolRegistry: ToolRegistry,
+    toolRuntime: ToolRuntime,
     config: AgentConfig,
+    sessionRepo?: SessionRepository
   ) {
     this.eventBus = new EventBus();
 
     this.loop = new ConversationLoop({
       llm,
-      toolRegistry,
+      toolRuntime,
       eventBus: this.eventBus,
       projectRoot: config.projectRoot,
       providerName: config.provider,
       modelName: config.model,
       maxIterations: config.maxIterations,
       dangerousCommands: config.dangerousCommands,
+      sessionRepo,
     });
   }
 
@@ -47,7 +51,7 @@ export class AgentRuntime {
    * Run the agent on a user message.
    * This is the single entry point for all interfaces (REPL, API, etc.).
    */
-  async run(input: RunInput): Promise<RunResult> {
+  async run(input: RunInput): Promise<RunResult & { sessionId?: string }> {
     return this.loop.run(input);
   }
 

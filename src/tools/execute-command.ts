@@ -1,22 +1,11 @@
-// ─── execute_command Tool ────────────────────────────────────────
-// Runs a shell command in the project root with timeout enforcement.
-// Captures stdout + stderr and returns them as readable text.
-//
-// Safety: patterns matching dangerousCommands in AgentConfig will be
-// blocked at the AgentRuntime level (Phase 4). The tool itself is
-// intentionally simple — safety is the runtime's responsibility.
-
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import type { ToolOutput } from '../types/tools.js';
+﻿import type { ToolOutput } from '../types/tools.js';
 import { BaseTool } from './_base-tool.js';
 import type { PathSandbox } from '../safety/path-sandbox.js';
-
-const execAsync = promisify(exec);
+import { defaultProcessManager } from '../execution/process-manager.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;  // 30 seconds
 const MAX_TIMEOUT_MS = 120_000;     // 2 minutes hard cap
-const MAX_OUTPUT_BYTES = 50_000;    // 50KB output cap (prevent flooding context)
+const MAX_OUTPUT_BYTES = 50_000;    // 50KB output cap
 
 export default class ExecuteCommandTool extends BaseTool {
   readonly definition = {
@@ -47,7 +36,6 @@ export default class ExecuteCommandTool extends BaseTool {
     },
   };
 
-  // Injected by AgentRuntime
   projectRoot: string = process.cwd();
   sandbox: PathSandbox | null = null;
 
@@ -62,7 +50,6 @@ export default class ExecuteCommandTool extends BaseTool {
 
     const timeoutMs = Math.min(timeoutSecs * 1000, MAX_TIMEOUT_MS);
 
-    // Resolve working directory through sandbox if available
     let cwd: string;
     if (workingDir) {
       cwd = this.sandbox ? this.sandbox.resolve(workingDir) : `${this.projectRoot}/${workingDir}`;
@@ -70,74 +57,47 @@ export default class ExecuteCommandTool extends BaseTool {
       cwd = this.projectRoot;
     }
 
-    let stdout = '';
-    let stderr = '';
-    let exitCode = 0;
-    let timedOut = false;
+    const result = await defaultProcessManager.runCommand({
+      command,
+      cwd,
+      timeoutMs,
+      maxBufferBytes: MAX_OUTPUT_BYTES / 2, // 25KB each for stdout and stderr
+    });
 
-    try {
-      const result = await execAsync(command, {
-        cwd,
-        timeout: timeoutMs,
-        maxBuffer: MAX_OUTPUT_BYTES,
-        shell: process.platform === 'win32' ? 'cmd.exe' : '/bin/sh',
-      });
-      stdout = result.stdout;
-      stderr = result.stderr;
-    } catch (error: any) {
-      if (error.killed || error.signal === 'SIGTERM') {
-        timedOut = true;
-      }
-      stdout = error.stdout ?? '';
-      stderr = error.stderr ?? '';
-      exitCode = error.code ?? 1;
-    }
-
-    // Format the output
     const lines: string[] = [];
 
     lines.push(`$ ${command}`);
-    lines.push(`Exit code: ${exitCode}${timedOut ? ' (TIMED OUT)' : ''}`);
+    lines.push(`Exit code: ${result.exitCode}${result.timedOut ? ' (TIMED OUT)' : ''}${result.aborted ? ' (ABORTED)' : ''}`);
 
-    if (stdout.trim()) {
-      const truncated = maybeTruncate(stdout, MAX_OUTPUT_BYTES / 2);
+    if (result.stdout.trim()) {
       lines.push('--- stdout ---');
-      lines.push(truncated);
+      lines.push(result.stdout);
     }
 
-    if (stderr.trim()) {
-      const truncated = maybeTruncate(stderr, MAX_OUTPUT_BYTES / 2);
+    if (result.stderr.trim()) {
       lines.push('--- stderr ---');
-      lines.push(truncated);
+      lines.push(result.stderr);
     }
 
-    if (!stdout.trim() && !stderr.trim()) {
+    if (!result.stdout.trim() && !result.stderr.trim()) {
       lines.push('(no output)');
     }
 
     const output = lines.join('\n');
-    const isError = exitCode !== 0 || timedOut;
+    const isError = result.exitCode !== 0 || result.timedOut || result.aborted;
 
-    if (timedOut) {
+    if (result.timedOut) {
       return this.fail(
         'COMMAND_TIMEOUT',
         `Command timed out after ${timeoutSecs}s: ${command}`,
-        `Try increasing the timeout or breaking the command into smaller steps.`,
+        `Try increasing the timeout or breaking the command into smaller steps.\n\n${output}`
       );
     }
 
     return {
       content: output,
       is_error: isError,
-      metadata: { exitCode, timedOut },
+      metadata: { exitCode: result.exitCode, timedOut: result.timedOut, aborted: result.aborted },
     };
   }
-}
-
-// ─── Helpers ────────────────────────────────────────────────────
-
-function maybeTruncate(text: string, maxBytes: number): string {
-  if (Buffer.byteLength(text, 'utf-8') <= maxBytes) return text;
-  const truncated = Buffer.from(text, 'utf-8').slice(0, maxBytes).toString('utf-8');
-  return truncated + `\n... (output truncated at ${maxBytes} bytes)`;
 }

@@ -12,10 +12,13 @@ import {
   DEFAULT_MODELS,
 } from './providers/provider-registry.js';
 import type { LLMProvider } from './types/providers.js';
-import { ToolRegistry } from './core/tool-registry.js';
+import { ToolRuntime } from './tools/tool-runtime.js';
 import { AgentRuntime } from './agent/agent-runtime.js';
 import type { AgentConfig } from './types/agent.js';
 import type { AgentEvent } from './events/event-types.js';
+import { getDatabase } from './storage/db.js';
+import { SessionRepository } from './storage/session-repo.js';
+import { join } from 'path';
 
 // ─── REPL Options ───────────────────────────────────────────────
 
@@ -23,6 +26,7 @@ export interface ReplOptions {
   provider: string;
   model: string;
   apiKey: string;
+  resumeSessionId?: string;
   projectRoot: string;
   maxIterations: number;
   maxTokens: number;
@@ -41,9 +45,11 @@ interface ReplState {
   model: string;
   llm: LLMProvider;
   runtime: AgentRuntime;
-  toolRegistry: ToolRegistry;
+  toolRuntime: ToolRuntime;
+  sessionRepo: SessionRepository;
   options: ReplOptions;
   unsubscribe: () => void;
+  activeSessionId?: string;
 }
 
 function buildAgentConfig(options: ReplOptions): AgentConfig {
@@ -155,10 +161,11 @@ function createEventRenderer(): {
 
 function createRuntime(
   llm: LLMProvider,
-  toolRegistry: ToolRegistry,
+  toolRuntime: ToolRuntime,
   options: ReplOptions,
+  sessionRepo: SessionRepository
 ): { runtime: AgentRuntime; unsubscribe: () => void } {
-  const runtime = new AgentRuntime(llm, toolRegistry, buildAgentConfig(options));
+  const runtime = new AgentRuntime(llm, toolRuntime, buildAgentConfig(options), sessionRepo);
   const renderer = createEventRenderer();
   const unsubscribe = runtime.eventBus.on(renderer.handler);
   return { runtime, unsubscribe };
@@ -209,10 +216,10 @@ function createSlashCommands(): SlashCommand[] {
 
         // Unsubscribe old event handler and create new runtime
         state.unsubscribe();
-        const { runtime, unsubscribe } = createRuntime(state.llm, state.toolRegistry, {
+        const { runtime, unsubscribe } = createRuntime(state.llm, state.toolRuntime, {
           ...state.options,
           model: newModel,
-        });
+        }, state.sessionRepo);
         state.runtime = runtime;
         state.unsubscribe = unsubscribe;
 
@@ -258,11 +265,11 @@ function createSlashCommands(): SlashCommand[] {
 
         // Unsubscribe old event handler and create new runtime
         state.unsubscribe();
-        const { runtime, unsubscribe } = createRuntime(state.llm, state.toolRegistry, {
+        const { runtime, unsubscribe } = createRuntime(state.llm, state.toolRuntime, {
           ...state.options,
           provider: newProvider,
           model: newModel,
-        });
+        }, state.sessionRepo);
         state.runtime = runtime;
         state.unsubscribe = unsubscribe;
 
@@ -274,7 +281,7 @@ function createSlashCommands(): SlashCommand[] {
       name: '/tools',
       description: 'List registered tools',
       handler: async (_args, state) => {
-        const tools = state.toolRegistry.listTools();
+        const tools = state.toolRuntime.listTools();
         if (tools.length === 0) {
           p.log.warn('No tools registered.');
         } else {
@@ -303,11 +310,17 @@ export async function startRepl(options: ReplOptions): Promise<void> {
   });
 
   // ── Discover tools ──────────────────────────────────────────
-  const toolRegistry = new ToolRegistry();
-  await toolRegistry.discoverBuiltinTools();
+  const toolRuntime = new ToolRuntime();
+  await toolRuntime.discoverBuiltinTools();
+
+  // ── Initialize DB ───────────────────────────────────────────
+  const dbDir = join(process.env.APPDATA || process.env.HOME || '.', '.pibot');
+  const dbPath = join(dbDir, 'sessions.db');
+  const db = getDatabase({ dbPath });
+  const sessionRepo = new SessionRepository(db);
 
   // ── Create AgentRuntime (with EventBus subscription) ────────
-  const { runtime, unsubscribe } = createRuntime(llm, toolRegistry, options);
+  const { runtime, unsubscribe } = createRuntime(llm, toolRuntime, options, sessionRepo);
 
   // ── State ───────────────────────────────────────────────────
   const state: ReplState = {
@@ -315,9 +328,11 @@ export async function startRepl(options: ReplOptions): Promise<void> {
     model: options.model,
     llm,
     runtime,
-    toolRegistry,
+    toolRuntime,
+    sessionRepo,
     options,
     unsubscribe,
+    activeSessionId: options.resumeSessionId,
   };
 
   const slashCommands = createSlashCommands();
@@ -326,7 +341,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
   p.intro('🤖 PπBot v0.1.0');
   p.log.info(`Provider: ${state.provider} │ Model: ${state.model}`);
   p.log.info(`Project:  ${options.projectRoot}`);
-  p.log.info(`Tools:    ${toolRegistry.listTools().join(', ') || 'none'}`);
+  p.log.info(`Tools:    ${toolRuntime.listTools().join(', ') || 'none'}`);
   p.log.step('Type /help for commands, /exit or Ctrl+C to quit.\n');
 
   // ── Loop ────────────────────────────────────────────────────
@@ -397,7 +412,12 @@ export async function startRepl(options: ReplOptions): Promise<void> {
       const result = await state.runtime.run({
         message: trimmed,
         signal: abortController.signal,
+        sessionId: state.activeSessionId,
       });
+
+      if (result.sessionId) {
+        state.activeSessionId = result.sessionId;
+      }
 
       stopInitialSpinner();
 
